@@ -64,6 +64,10 @@ Version: 3.1.6
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import mimetypes
+import os
 import re
 import time
 import uuid
@@ -191,6 +195,7 @@ class MessageRecord:
     has_gif: bool = False
     gif_count: int = 0
     image_urls: list[str] = field(default_factory=list)
+    image_local_paths: list[str] = field(default_factory=list)
 
 
 def _normalize_at_target(
@@ -1337,6 +1342,20 @@ class Main(star.Star):
         self._image_caption_semaphore = asyncio.Semaphore(3)  # 最多并发3个
         self._image_caption_cache: OrderedDict[str, str] = OrderedDict()  # URL -> caption (LRU)
         self._image_caption_cache_max = 100  # 硬上限
+        # 图片本地缓存目录（lazy 模式提前下载用）
+        self._image_cache_dir = os.path.expanduser(
+            str(self._cfg("image_cache_dir", "data/temp/context_aware_images") or "")
+        )
+        try:
+            os.makedirs(self._image_cache_dir, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"[ContextAware] 无法创建图片缓存目录 {self._image_cache_dir}: {e}")
+            self._image_cache_dir = ""
+        self._image_download_cache: dict[str, str | None] = {}  # URL -> local_path_or_None
+        # 缓存下载大小上限（50MB）
+        self._image_download_max_bytes = max(
+            1, self._cfg_int("image_download_max_bytes", 50 * 1024 * 1024)
+        )
         # 用户可配置超时（范围校验：10-600秒，与 schema 对齐）
         _timeout_cfg = self._cfg_int("image_caption_timeout", 60)
         if _timeout_cfg < 10 or _timeout_cfg > 600:
@@ -1664,6 +1683,114 @@ class Main(star.Star):
         except Exception:
             return False
 
+    async def _download_image_to_local(self, image_url: str) -> str | None:
+        """下载图片到本地缓存目录，返回本地文件路径。"""
+        if not image_url or not image_url.startswith("http"):
+            return None
+        if not self._image_cache_dir:
+            return None
+
+        # 检查是否已下载过
+        if image_url in self._image_download_cache:
+            cached = self._image_download_cache[image_url]
+            if cached and os.path.exists(cached):
+                return cached
+            return None
+
+        # 生成缓存文件名
+        url_hash = hashlib.md5(image_url.encode()).hexdigest()
+        ext = ".jpg"
+        lower_url = image_url.lower()
+        if ".png" in lower_url:
+            ext = ".png"
+        elif ".gif" in lower_url:
+            ext = ".gif"
+        elif ".webp" in lower_url:
+            ext = ".webp"
+
+        local_path = os.path.join(self._image_cache_dir, f"{url_hash}{ext}")
+
+        if os.path.exists(local_path):
+            self._image_download_cache[image_url] = local_path
+            return local_path
+
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as session:
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/134.0.0.0 Safari/537.36"
+                    ),
+                }
+                async with session.get(image_url, headers=headers) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            f"[ContextAware] 图片下载失败 HTTP {resp.status}: {image_url[:60]}..."
+                        )
+                        self._image_download_cache[image_url] = None
+                        return None
+
+                    # 检查 Content-Length，超过上限直接跳过
+                    cl = resp.content_length
+                    if cl is not None and cl > self._image_download_max_bytes:
+                        logger.warning(
+                            f"[ContextAware] 图片过大 ({cl} bytes)，跳过缓存: {image_url[:60]}..."
+                        )
+                        self._image_download_cache[image_url] = None
+                        return None
+
+                    # 分块读取，限制总大小
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(65536):
+                        total += len(chunk)
+                        if total > self._image_download_max_bytes:
+                            logger.warning(
+                                f"[ContextAware] 图片下载超过上限 "
+                                f"({self._image_download_max_bytes} bytes)，已中止: "
+                                f"{image_url[:60]}..."
+                            )
+                            self._image_download_cache[image_url] = None
+                            return None
+                        chunks.append(chunk)
+                    content = b"".join(chunks)
+
+                    if not content:
+                        self._image_download_cache[image_url] = None
+                        return None
+                    with open(local_path, "wb") as f:
+                        f.write(content)
+            self._image_download_cache[image_url] = local_path
+            logger.info(
+                f"[ContextAware] 图片已缓存到本地 ({len(content)} bytes): "
+                f"{os.path.basename(local_path)}"
+            )
+            return local_path
+        except Exception as e:
+            logger.warning(f"[ContextAware] 图片下载异常: {e}")
+            self._image_download_cache[image_url] = None
+            return None
+
+    @staticmethod
+    def _local_path_to_data_uri(local_path: str) -> str | None:
+        """将本地图片文件转为 data URI。"""
+        if not os.path.exists(local_path):
+            return None
+        try:
+            with open(local_path, "rb") as f:
+                raw = f.read()
+            mime_type, _ = mimetypes.guess_type(local_path)
+            if not mime_type:
+                mime_type = "image/jpeg"
+            b64 = base64.b64encode(raw).decode("ascii")
+            return f"data:{mime_type};base64,{b64}"
+        except Exception as e:
+            logger.warning(f"[ContextAware] 图片转 data URI 失败: {e}")
+            return None
+
     async def _get_image_caption(self, image_url: str) -> str | None:
         """获取图片描述（v3.0.0: 并发限流 + 超时 + 缓存）"""
         if not self._image_caption_enabled:
@@ -1765,14 +1892,24 @@ class Main(star.Star):
             # 有未描述的图片，逐一转述
             new_content = msg.content
             caption_index = 0
-            for url in msg.image_urls:
+            for img_idx, url in enumerate(msg.image_urls):
                 is_gif = _image_ref_looks_like_gif(url)
                 if is_gif and not self._show_recent_images_allow_gif:
                     idx = new_content.find("[图片]", caption_index)
                     if idx >= 0:
                         caption_index = idx + 4
                     continue
-                caption = await self._get_image_caption(url)
+
+                # 优先使用本地缓存路径（data URI 替代原始 URL）
+                input_url = url
+                if msg.image_local_paths and img_idx < len(msg.image_local_paths):
+                    local_path = msg.image_local_paths[img_idx]
+                    if local_path and os.path.exists(local_path):
+                        data_uri = self._local_path_to_data_uri(local_path)
+                        if data_uri:
+                            input_url = data_uri
+
+                caption = await self._get_image_caption(input_url)
                 if caption:
                     # 替换 content 中对应位置的 [图片] 标记
                     # 按顺序替换，每次替换第一个 [图片] 标记
@@ -1802,6 +1939,7 @@ class Main(star.Star):
                     has_gif=msg.has_gif,
                     gif_count=msg.gif_count,
                     image_urls=list(msg.image_urls),
+                    image_local_paths=list(msg.image_local_paths),
                 ))
             else:
                 updated.append(msg)
@@ -1816,6 +1954,7 @@ class Main(star.Star):
         sender_id = event.get_sender_id()
         parts: list[str] = []
         collected_image_urls: list[str] = []
+        collected_local_paths: list[str] = []
         message_outline = _event_message_outline(event)
         voice_transcript = _event_voice_transcript(event)
         image_count = 0
@@ -1852,6 +1991,19 @@ class Main(star.Star):
                     else:
                         parts.append("[图片]")
                 else:
+                    # lazy 模式：下载图片到本地缓存，后续识图走本地文件
+                    # 但如果是不允许转述的 GIF，跳过下载（下了也用不到）
+                    should_download = (
+                        image_url
+                        and self._image_caption_enabled
+                        and self._image_caption_lazy
+                        and (not is_gif or self._show_recent_images_allow_gif)
+                    )
+                    if should_download:
+                        local_path = await self._download_image_to_local(image_url)
+                        collected_local_paths.append(local_path or "")
+                    else:
+                        collected_local_paths.append("")  # placeholder
                     parts.append("[图片]")
 
         has_image = image_count > 0 or (not has_plain_text and _looks_like_image_outline(message_outline))
@@ -1872,6 +2024,7 @@ class Main(star.Star):
             has_gif=gif_count > 0,
             gif_count=gif_count,
             image_urls=collected_image_urls,
+            image_local_paths=collected_local_paths,
         )
 
         # 提取 @ 和回复信息

@@ -128,6 +128,28 @@
       "image_caption": true
     }
   },
+  "image_cache_dir": {
+    "description": "图片本地缓存目录（lazy 模式提前下载用）",
+    "type": "string",
+    "default": "data/temp/context_aware_images",
+    "hint": "相对于 AstrBot 数据目录，或绝对路径。收到图片时先下载到此目录，避免 URL 过期后识图失败。",
+    "condition": {
+      "image_caption": true,
+      "image_caption_lazy": true
+    }
+  },
+  "image_download_max_bytes": {
+    "description": "图片缓存下载大小上限（字节）",
+    "type": "int",
+    "default": 52428800,
+    "min": 1,
+    "max": 104857600,
+    "hint": "超过此大小的图片不会被缓存下载，默认 50MB",
+    "condition": {
+      "image_caption": true,
+      "image_caption_lazy": true
+    }
+  },
   "history_compress_strategy": {
     "description": "群聊历史压缩策略（可选）",
     "type": "string",
