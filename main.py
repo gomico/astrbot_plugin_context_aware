@@ -1690,9 +1690,13 @@ class Main(star.Star):
     async def _download_image_to_local(self, image_url: str) -> str | None:
         """下载图片到本地缓存目录，返回本地文件路径。"""
         if not image_url or not image_url.startswith("http"):
+            logger.info(f"[ContextAware] [DEBUG] dl skipped: url invalid ({image_url[:50] if image_url else 'none'})")
             return None
         if not self._image_cache_dir:
+            logger.info("[ContextAware] [DEBUG] dl skipped: cache_dir empty")
             return None
+
+        logger.info(f"[ContextAware] [DEBUG] dl start: {image_url[:60]}...")
 
         # 检查是否已下载过
         if image_url in self._image_download_cache:
