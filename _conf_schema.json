@@ -150,6 +150,18 @@
       "image_caption_lazy": true
     }
   },
+  "image_cache_ttl": {
+    "description": "缓存文件保留时间（秒）",
+    "type": "int",
+    "default": 3600,
+    "min": 60,
+    "max": 604800,
+    "hint": "超过此时间的缓存文件在插件启动时会被清理，默认3600秒（1小时）",
+    "condition": {
+      "image_caption": true,
+      "image_caption_lazy": true
+    }
+  },
   "history_compress_strategy": {
     "description": "群聊历史压缩策略（可选）",
     "type": "string",

@@ -1360,6 +1360,11 @@ class Main(star.Star):
         self._image_download_max_bytes = max(
             1, self._cfg_int("image_download_max_bytes", 50 * 1024 * 1024)
         )
+        # 缓存文件保留时间（秒），默认 1 小时，启动时清理过期文件
+        self._image_cache_ttl = max(
+            60, self._cfg_int("image_cache_ttl", 3600)
+        )
+        self._cleanup_image_cache()
         # 用户可配置超时（范围校验：10-600秒，与 schema 对齐）
         _timeout_cfg = self._cfg_int("image_caption_timeout", 60)
         if _timeout_cfg < 10 or _timeout_cfg > 600:
@@ -1686,6 +1691,34 @@ class Main(star.Star):
                     return True
         except Exception:
             return False
+
+    def _cleanup_image_cache(self) -> None:
+        """启动时清理过期缓存文件。"""
+        if not self._image_cache_dir or not os.path.isdir(self._image_cache_dir):
+            return
+        now = time.time()
+        cutoff = now - self._image_cache_ttl
+        removed = 0
+        total_size = 0
+        try:
+            for fname in os.listdir(self._image_cache_dir):
+                fpath = os.path.join(self._image_cache_dir, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                total_size += os.path.getsize(fpath)
+                mtime = os.path.getmtime(fpath)
+                if mtime < cutoff:
+                    try:
+                        os.remove(fpath)
+                        removed += 1
+                    except Exception:
+                        pass
+            logger.info(
+                f"[ContextAware] 缓存清理: 移除 {removed} 个过期文件, "
+                f"剩余 {total_size / 1024:.0f} KB"
+            )
+        except Exception as e:
+            logger.warning(f"[ContextAware] 缓存清理异常: {e}")
 
     async def _download_image_to_local(self, image_url: str) -> str | None:
         """下载图片到本地缓存目录，返回本地文件路径。
