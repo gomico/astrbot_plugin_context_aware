@@ -83,6 +83,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
 from astrbot.api.provider import LLMResponse, Provider, ProviderRequest
 from astrbot.core.agent.message import TextPart
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 if TYPE_CHECKING:
     from astrbot.core.config import AstrBotConfig
@@ -1343,8 +1344,11 @@ class Main(star.Star):
         self._image_caption_cache: OrderedDict[str, str] = OrderedDict()  # URL -> caption (LRU)
         self._image_caption_cache_max = 100  # 硬上限
         # 图片本地缓存目录（lazy 模式提前下载用）
+        default_cache_dir = os.path.join(
+            get_astrbot_plugin_data_path(), "context_aware_images"
+        )
         self._image_cache_dir = os.path.expanduser(
-            str(self._cfg("image_cache_dir", "~/.cache/context_aware_images") or "")
+            str(self._cfg("image_cache_dir", default_cache_dir) or default_cache_dir)
         )
         try:
             os.makedirs(self._image_cache_dir, exist_ok=True)

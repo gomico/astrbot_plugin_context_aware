@@ -131,8 +131,8 @@
   "image_cache_dir": {
     "description": "图片本地缓存目录（lazy 模式提前下载用）",
     "type": "string",
-    "default": "data/temp/context_aware_images",
-    "hint": "相对于 AstrBot 数据目录，或绝对路径。收到图片时先下载到此目录，避免 URL 过期后识图失败。",
+    "default": "",
+    "hint": "留空则自动使用 AstrBot plugin_data/context_aware_images。收到图片时先下载到此目录再送视觉模型，避免 URL 过期。",
     "condition": {
       "image_caption": true,
       "image_caption_lazy": true
