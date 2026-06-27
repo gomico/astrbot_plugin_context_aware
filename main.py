@@ -1344,7 +1344,7 @@ class Main(star.Star):
         self._image_caption_cache_max = 100  # 硬上限
         # 图片本地缓存目录（lazy 模式提前下载用）
         self._image_cache_dir = os.path.expanduser(
-            str(self._cfg("image_cache_dir", "data/temp/context_aware_images") or "")
+            str(self._cfg("image_cache_dir", "~/.cache/context_aware_images") or "")
         )
         try:
             os.makedirs(self._image_cache_dir, exist_ok=True)
