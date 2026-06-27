@@ -1696,10 +1696,23 @@ class Main(star.Star):
         if not image_url:
             return None
 
-        # 已经是本地文件路径：确认存在后直接返回
+        # 已经是本地文件路径：复制到缓存目录持久化，避免被临时文件清理删掉
         if not image_url.startswith("http"):
             if os.path.exists(image_url):
-                return image_url
+                if not self._image_cache_dir:
+                    return image_url
+                url_hash = hashlib.md5(image_url.encode()).hexdigest()
+                _, ext = os.path.splitext(image_url)
+                if not ext:
+                    ext = ".jpg"
+                cached_path = os.path.join(self._image_cache_dir, f"{url_hash}{ext}")
+                if not os.path.exists(cached_path):
+                    import shutil
+                    try:
+                        shutil.copy2(image_url, cached_path)
+                    except Exception:
+                        return image_url  # fallback 到原路径
+                return cached_path
             return None
 
         if not self._image_cache_dir:
