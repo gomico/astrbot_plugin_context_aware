@@ -1699,27 +1699,7 @@ class Main(star.Star):
         # 已经是本地文件路径：确认存在后直接返回
         if not image_url.startswith("http"):
             if os.path.exists(image_url):
-                # 复制到缓存目录，统一管理
-                if not self._image_cache_dir:
-                    return image_url  # 没有缓存目录也直接返回原路径
-                url_hash = hashlib.md5(image_url.encode()).hexdigest()
-                _, ext = os.path.splitext(image_url)
-                if not ext:
-                    ext = ".jpg"
-                cached_path = os.path.join(self._image_cache_dir, f"{url_hash}{ext}")
-                if not os.path.exists(cached_path):
-                    import shutil
-                    try:
-                        shutil.copy2(image_url, cached_path)
-                        logger.info(
-                            f"[ContextAware] 图片已缓存到本地 ({os.path.getsize(cached_path)} bytes): "
-                            f"{os.path.basename(cached_path)}"
-                        )
-                    except Exception as e:
-                        logger.warning(f"[ContextAware] 图片缓存复制失败: {e}")
-                        return image_url  # fallback 到原路径
-                self._image_download_cache[image_url] = cached_path
-                return cached_path
+                return image_url
             return None
 
         if not self._image_cache_dir:
