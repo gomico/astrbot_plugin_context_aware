@@ -2003,6 +2003,16 @@ class Main(star.Star):
                         and self._image_caption_lazy
                         and (not is_gif or self._show_recent_images_allow_gif)
                     )
+                    logger.info(
+                        f"[ContextAware] [DEBUG] lazy img: "
+                        f"url={'yes' if image_url else 'no'} "
+                        f"caption={self._image_caption_enabled} "
+                        f"lazy={self._image_caption_lazy} "
+                        f"gif={is_gif} "
+                        f"allow_gif={self._show_recent_images_allow_gif} "
+                        f"should_dl={should_download} "
+                        f"cache_dir={'set' if self._image_cache_dir else 'EMPTY!'}"
+                    )
                     if should_download:
                         local_path = await self._download_image_to_local(image_url)
                         collected_local_paths.append(local_path or "")
