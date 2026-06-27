@@ -90,6 +90,15 @@
     "default": false,
     "hint": "启用后每张图片会调用一次LLM，会产生额外费用和延迟"
   },
+  "image_caption_lazy": {
+    "description": "延迟图像转述",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后图片不会在到达时立即描述，而是在 LLM 准备回复时才描述窗口内的图片，避免无效调用；会略微增加回复延迟",
+    "condition": {
+      "image_caption": true
+    }
+  },
   "image_caption_provider_id": {
     "description": "图像转述使用的提供商",
     "type": "string",

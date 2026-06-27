@@ -71,6 +71,8 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, final
 
+import aiohttp
+
 from astrbot import logger
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
@@ -188,6 +190,7 @@ class MessageRecord:
     image_count: int = 0
     has_gif: bool = False
     gif_count: int = 0
+    image_urls: list[str] = field(default_factory=list)
 
 
 def _normalize_at_target(
@@ -1324,6 +1327,7 @@ class Main(star.Star):
 
         # 图像转述配置
         self._image_caption_enabled = self._cfg_bool("image_caption", False)
+        self._image_caption_lazy = self._cfg_bool("image_caption_lazy", False)
         self._image_caption_provider_id = str(self._cfg("image_caption_provider_id", "") or "")
         self._image_caption_prompt = str(
             self._cfg("image_caption_prompt", "请用中文简洁描述这张图片的内容，不超过50字。") or ""
@@ -1362,6 +1366,8 @@ class Main(star.Star):
 
         version = "3.1.6"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
+        if self._image_caption_enabled and self._image_caption_lazy:
+            caption_status += "（lazy 模式）"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
     def _cfg(self, key: str, default: Any = None) -> Any:
@@ -1625,18 +1631,59 @@ class Main(star.Star):
             await self._sessions.clear_compressing_async(umo)
             return snapshot
 
+    def _mark_url_failed(self, image_url: str) -> None:
+        """缓存失败的URL（用空字符串作为哨兵），避免后续对同一URL重复请求"""
+        self._image_caption_cache[image_url] = ""
+        while len(self._image_caption_cache) > self._image_caption_cache_max:
+            self._image_caption_cache.popitem(last=False)
+
+    async def _url_is_reachable(self, image_url: str) -> bool:
+        """快速预检图片URL是否可达（用 GET+Range 代替 HEAD，避免部分 CDN 不支持 HEAD 的问题）
+
+        只拦截连接级异常（DNS 解析失败、连接被拒、超时等），
+        能拿到任何 HTTP 响应（包括 4xx/5xx）都视为可达，
+        让 LLM provider 自行决定能否获取。
+        """
+        if not image_url.startswith("http"):
+            return True
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as session:
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/134.0.0.0 Safari/537.36"
+                    ),
+                    "Range": "bytes=0-0",
+                }
+                async with session.get(image_url, headers=headers) as _resp:
+                    # 能拿到响应头即视为可达
+                    return True
+        except Exception:
+            return False
+
     async def _get_image_caption(self, image_url: str) -> str | None:
         """获取图片描述（v3.0.0: 并发限流 + 超时 + 缓存）"""
         if not self._image_caption_enabled:
             return None
 
-        # 缓存命中检查
+        # 缓存命中检查：空字符串为上次失败的哨兵
         if image_url in self._image_caption_cache:
             self._image_caption_cache_hits += 1
-            # 移动到末尾（LRU 更新）
             self._image_caption_cache.move_to_end(image_url)
-            return self._image_caption_cache[image_url]
+            cached = self._image_caption_cache[image_url]
+            return cached if cached else None
 
+        # 快速预检：URL不可达则直接标记失败，不消耗LLM调用
+        if not await self._url_is_reachable(image_url):
+            logger.warning(f"[ContextAware] 图片URL不可达，跳过转述: {image_url[:60]}...")
+            self._image_caption_errors += 1
+            self._mark_url_failed(image_url)
+            return None
+
+        t0 = time.perf_counter()
         try:
             # 并发限流
             async with self._image_caption_semaphore:
@@ -1666,11 +1713,14 @@ class Main(star.Star):
                         timeout=self._image_caption_timeout
                     )
                 except asyncio.TimeoutError:
+                    elapsed = time.perf_counter() - t0
                     self._image_caption_errors += 1
-                    logger.warning(f"[ContextAware] 图像转述超时 ({self._image_caption_timeout}s)")
+                    logger.warning(f"[ContextAware] 图像转述超时 ({self._image_caption_timeout}s, 耗时 {elapsed:.1f}s)")
+                    self._mark_url_failed(image_url)  # 防重试
                     return None
 
                 if response and response.completion_text:
+                    elapsed = time.perf_counter() - t0
                     self._image_caption_count += 1
                     caption = response.completion_text.strip()
                     # 限制长度
@@ -1681,14 +1731,81 @@ class Main(star.Star):
                     # LRU 淘汰：超过硬上限时移除最旧的
                     while len(self._image_caption_cache) > self._image_caption_cache_max:
                         self._image_caption_cache.popitem(last=False)
-                    logger.debug(f"[ContextAware] 图像转述成功: {caption[:30]}...")
+                    logger.info(f"[ContextAware] 图像转述完成 ({elapsed:.1f}s) | {caption[:40]}...")
                     return caption
 
+                # LLM返回空响应（如图片被核心静默丢弃等），标记失败
+                self._mark_url_failed(image_url)
+                return None
+
         except Exception as e:
+            elapsed = time.perf_counter() - t0
             self._image_caption_errors += 1
-            logger.error(f"[ContextAware] 图像转述失败: {e}")
+            logger.error(f"[ContextAware] 图像转述失败 ({elapsed:.1f}s): {e}")
+            self._mark_url_failed(image_url)
 
         return None
+
+    async def _lazy_caption_flow(
+        self, messages: list[MessageRecord]
+    ) -> list[MessageRecord]:
+        """延迟图像转述：对 image_flow 中尚未描述的图片进行转述（在 LLM 请求时触发）"""
+        if not self._image_caption_enabled or not self._image_caption_lazy or not messages:
+            return messages
+
+        updated: list[MessageRecord] = []
+        for msg in messages:
+            if not msg.image_urls:
+                updated.append(msg)
+                continue
+            # 检查 content 是否已有描述
+            if "[图片: " in msg.content:
+                updated.append(msg)
+                continue
+            # 有未描述的图片，逐一转述
+            new_content = msg.content
+            caption_index = 0
+            for url in msg.image_urls:
+                is_gif = _image_ref_looks_like_gif(url)
+                if is_gif and not self._show_recent_images_allow_gif:
+                    idx = new_content.find("[图片]", caption_index)
+                    if idx >= 0:
+                        caption_index = idx + 4
+                    continue
+                caption = await self._get_image_caption(url)
+                if caption:
+                    # 替换 content 中对应位置的 [图片] 标记
+                    # 按顺序替换，每次替换第一个 [图片] 标记
+                    idx = new_content.find("[图片]", caption_index)
+                    if idx >= 0:
+                        new_content = new_content[:idx] + f"[图片: {caption}]" + new_content[idx + 4:]
+                        caption_index = idx + len(f"[图片: {caption}]")
+                    else:
+                        new_content += f" | [图片: {caption}]"
+            if new_content != msg.content:
+                updated.append(MessageRecord(
+                    msg_id=msg.msg_id,
+                    sender_id=msg.sender_id,
+                    sender_name=msg.sender_name,
+                    content=new_content[:500],
+                    timestamp=msg.timestamp,
+                    is_bot=msg.is_bot,
+                    at_bot=msg.at_bot,
+                    at_all=msg.at_all,
+                    reply_to_id=msg.reply_to_id,
+                    talking_to=msg.talking_to,
+                    talking_to_name=msg.talking_to_name,
+                    at_targets=list(msg.at_targets),
+                    message_outline=msg.message_outline,
+                    has_image=msg.has_image,
+                    image_count=msg.image_count,
+                    has_gif=msg.has_gif,
+                    gif_count=msg.gif_count,
+                    image_urls=list(msg.image_urls),
+                ))
+            else:
+                updated.append(msg)
+        return updated
 
     async def _extract_message_with_caption(
         self, event: AstrMessageEvent
@@ -1698,6 +1815,7 @@ class Main(star.Star):
 
         sender_id = event.get_sender_id()
         parts: list[str] = []
+        collected_image_urls: list[str] = []
         message_outline = _event_message_outline(event)
         voice_transcript = _event_voice_transcript(event)
         image_count = 0
@@ -1716,11 +1834,13 @@ class Main(star.Star):
             elif isinstance(comp, Image):
                 image_count += 1
                 image_url = SceneAnalyzer._image_ref_from_component(comp)
+                if image_url:
+                    collected_image_urls.append(image_url)
                 is_gif = _image_ref_looks_like_gif(image_url)
                 if is_gif:
                     gif_count += 1
-                # 尝试图像转述
-                if self._image_caption_enabled and (
+                # 尝试图像转述（非 lazy 模式才在消息到达时描述）
+                if self._image_caption_enabled and not self._image_caption_lazy and (
                     not is_gif or self._show_recent_images_allow_gif
                 ):
                     if image_url:
@@ -1751,6 +1871,7 @@ class Main(star.Star):
             image_count=max(image_count, 1 if has_image else 0),
             has_gif=gif_count > 0,
             gif_count=gif_count,
+            image_urls=collected_image_urls,
         )
 
         # 提取 @ 和回复信息
@@ -1933,6 +2054,15 @@ class Main(star.Star):
                 if self._voice_context_window > 0
                 else []
             )
+
+            # lazy 模式：在生成场景前对窗口内的图片进行转述
+            if (
+                self._show_recent_images
+                and self._image_caption_enabled
+                and self._image_caption_lazy
+                and image_flow
+            ):
+                image_flow = await self._lazy_caption_flow(image_flow)
 
             now = time.time()
             bot_status: dict[str, float | str | bool] = {}
