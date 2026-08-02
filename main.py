@@ -66,6 +66,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import mimetypes
 import os
 import re
@@ -76,6 +77,11 @@ import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, final
+
+try:
+    from PIL import Image as PILImage
+except Exception:  # Pillow 为可选依赖，缺失时跳过图片压缩
+    PILImage = None
 
 from astrbot import logger
 from astrbot.api import star
@@ -1374,6 +1380,12 @@ class Main(star.Star):
         self._image_download_max_bytes = max(
             1, self._cfg_int("image_download_max_bytes", 50 * 1024 * 1024)
         )
+        # 图像转述前压缩：最长边超过该值（像素）则等比压缩，0 表示不压缩。
+        # 默认 2048 与 VLM 输入边长上限（如 Qwen3-VL MAX_VLM_DIMENSION=2048）对齐：
+        # 模型最多能处理 2048，压到更小只会损失文字可读性而不会减少 token 需求。
+        self._image_caption_max_dimension = max(
+            0, self._cfg_int("image_caption_max_dimension", 2048)
+        )
         # 缓存文件保留时间（秒），默认 1 小时；启动时、后台任务和下载前都会清理过期文件
         self._image_cache_ttl = max(
             60, self._cfg_int("image_cache_ttl", 3600)
@@ -1898,11 +1910,69 @@ class Main(star.Star):
             return None
 
     @staticmethod
-    def _local_path_to_data_uri(local_path: str) -> str | None:
-        """将本地图片文件转为 data URI。"""
+    def _compress_image_to_data_uri(local_path: str, max_dimension: int) -> str | None:
+        """将图片等比压缩（最长边 ≤ max_dimension）后转为 data URI。
+
+        - 静态图：仅在最长边超限时等比缩放；否则返回 None（无需压缩）
+        - GIF 动图：无论尺寸，总是取第一帧静态化（转述只需画面内容，不需要动画）
+        - 透明图（PNG/GIF）：合成到白色背景再转 JPEG，避免透明区域变黑
+        - 压缩失败返回 None，由调用方回退原逻辑
+        """
+        if PILImage is None:
+            return None
+        try:
+            with PILImage.open(local_path) as im:
+                is_animated = bool(getattr(im, "is_animated", False))
+                if is_animated:
+                    im.seek(0)
+                width, height = im.size
+                longest = max(width, height)
+                # 动图总是取第一帧静态化；静态图仅在超限时压缩
+                if not is_animated and longest <= max_dimension:
+                    return None  # 无需压缩
+                if longest > max_dimension:
+                    scale = max_dimension / longest
+                    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                    # 兼容旧版 Pillow：Resampling 枚举是 Pillow 10+ 引入，旧版用 Image.LANCZOS
+                    resample = getattr(PILImage, "Resampling", PILImage).LANCZOS
+                    im = im.resize(new_size, resample)
+                # 透明通道合成白色背景，避免透明区域在 JPEG 下变黑。
+                # 覆盖 RGBA/LA/P 模式，以及带 PNG tRNS 透明块的 RGB/L 模式
+                has_transparency = im.mode in ("RGBA", "LA", "P") or bool(
+                    im.info.get("transparency")
+                )
+                if has_transparency:
+                    rgba = im.convert("RGBA")
+                    bg = PILImage.new("RGB", rgba.size, (255, 255, 255))
+                    bg.paste(rgba, mask=rgba.getchannel("A"))
+                    im = bg
+                else:
+                    im = im.convert("RGB")
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=90, optimize=True)
+                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                return f"data:image/jpeg;base64,{b64}"
+        except Exception as e:
+            logger.warning(f"[ContextAware] 图片压缩失败，使用原图: {e}")
+            return None
+
+    @staticmethod
+    def _local_path_to_data_uri(local_path: str, max_dimension: int = 0) -> str | None:
+        """将本地图片文件转为 data URI。
+
+        当 max_dimension > 0 且图片最长边超过该值时，用 Pillow 等比压缩后
+        再编码，避免超大 base64 payload 撑爆 LLM 请求和日志。
+        GIF 动图取第一帧静态化压缩（转述只需画面内容，不需要动画）。
+        """
         if not os.path.exists(local_path):
             return None
         try:
+            # 压缩路径：Pillow 可用 + 配置了上限 + 图片确实超限
+            if max_dimension > 0 and PILImage is not None:
+                compressed = Main._compress_image_to_data_uri(local_path, max_dimension)
+                if compressed:
+                    return compressed
+            # 兜底：原逻辑（无需压缩 / Pillow 不可用 / 压缩失败）
             with open(local_path, "rb") as f:
                 raw = f.read()
             mime_type, _ = mimetypes.guess_type(local_path)
@@ -2017,11 +2087,16 @@ class Main(star.Star):
                     continue
 
                 # 优先使用本地缓存路径（data URI 替代原始 URL）
+                # to_thread: Pillow 解码/缩放/编码是 CPU 密集操作，放线程池避免阻塞事件循环
                 input_url = url
                 if msg.image_local_paths and img_idx < len(msg.image_local_paths):
                     local_path = msg.image_local_paths[img_idx]
                     if local_path and os.path.exists(local_path):
-                        data_uri = self._local_path_to_data_uri(local_path)
+                        data_uri = await asyncio.to_thread(
+                            self._local_path_to_data_uri,
+                            local_path,
+                            self._image_caption_max_dimension,
+                        )
                         if data_uri:
                             input_url = data_uri
 

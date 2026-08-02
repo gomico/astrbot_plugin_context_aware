@@ -128,6 +128,17 @@
       "image_caption": true
     }
   },
+  "image_caption_max_dimension": {
+    "description": "图像转述前图片最长边压缩上限（像素），超过则等比压缩；0 表示不压缩",
+    "type": "int",
+    "default": 2048,
+    "min": 0,
+    "max": 4096,
+    "hint": "默认 2048，与 VLM 输入边长上限对齐。压尺寸不压质量（JPEG q90），对文字可读性影响小",
+    "condition": {
+      "image_caption": true
+    }
+  },
   "image_cache_dir": {
     "description": "图片本地缓存目录（lazy 模式提前下载用）",
     "type": "string",
@@ -166,8 +177,14 @@
     "description": "群聊历史压缩策略（可选）",
     "type": "string",
     "default": "off",
-    "options": ["off", "llm_summary"],
-    "labels": ["关闭", "LLM 摘要压缩"],
+    "options": [
+      "off",
+      "llm_summary"
+    ],
+    "labels": [
+      "关闭",
+      "LLM 摘要压缩"
+    ],
     "hint": "开启后会额外调用一次 LLM 来生成摘要，用于降低上下文膨胀与误判风险。"
   },
   "history_compress_trigger_count": {
