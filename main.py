@@ -930,7 +930,9 @@ class SceneAnalyzer:
                     TRIGGER_ACTIVE,
                     f"{sender} 明确在和 {_format_name_list(other_targets)} 对话，你是被动卷入的",
                 )
-            return TRIGGER_UNKNOWN, "存在触发信号，但不是在明确呼叫你"
+            # 系统（如 AngelHeart 概率唤醒）已判定应当参与：
+            # 视为明确的唤醒信号，而不是"未知触发"，避免注入"建议保持沉默"指令
+            return TRIGGER_WAKE, "系统已判定你应当参与当前对话"
 
         # 如果没有任何显式唤醒条件但仍触发了 LLM 请求，通常属于“主动回复/主动搭话”类场景
         # （例如 AstrBot 的主动回复功能或其他插件主动调用 request_llm）
