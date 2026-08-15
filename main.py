@@ -922,6 +922,8 @@ class SceneAnalyzer:
                 )
                 if qq_str == self._bot_id:
                     msg.at_bot = True
+                elif qq_str == "all":
+                    msg.at_all = True
             elif isinstance(comp, AtAll):
                 msg.at_all = True
             elif isinstance(comp, Reply):
@@ -2958,6 +2960,8 @@ class Main(star.Star):
                 )
                 if qq_str == self._analyzer.bot_id:
                     msg.at_bot = True
+                elif qq_str == "all":
+                    msg.at_all = True
             elif isinstance(comp, AtAll):
                 msg.at_all = True
             elif isinstance(comp, Reply):
