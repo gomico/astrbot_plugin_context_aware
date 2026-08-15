@@ -163,7 +163,7 @@ DEFAULT_REPLY_STARTERS: Final = frozenset({
 IMAGE_CACHE_CLEANUP_INTERVAL: Final = 60
 IMAGE_CACHE_PREFIX: Final = "context-aware-"
 IMAGE_CACHE_FILENAME_RE = re.compile(
-    rf"{re.escape(IMAGE_CACHE_PREFIX)}[0-9a-f]{{32}}\.(?:jpg|jpeg|png|gif|webp|bmp|ico)",
+    rf"{re.escape(IMAGE_CACHE_PREFIX)}[0-9a-f]{{32}}\.(?:jpg|jpeg|png|gif|webp|bmp|ico|bin)",
     re.IGNORECASE,
 )
 
@@ -1986,6 +1986,32 @@ class Main(star.Star):
             logger.warning(f"[ContextAware] 图片转 data URI 失败: {e}")
             return None
 
+    def _image_url_still_alive_sync(self, image_url: str) -> bool:
+        """轻量探测远程图片 URL 是否仍可访问。
+
+        QQ 等平台的图片链接带 rkey 签名，过期后返回 4xx；此时转述请求里
+        图片会被核心预处理丢弃、视觉模型只收到文字，白白消耗 15-45 秒。
+        这里只读少量字节即关闭连接，避免整图下载开销。
+        """
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/134.0.0.0 Safari/537.36"
+            ),
+            "Range": "bytes=0-1023",
+        }
+        req = urllib.request.Request(image_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status = getattr(resp, "status", 200)
+                if status >= 400:
+                    return False
+                resp.read(1024)
+                return True
+        except Exception:
+            return False
+
     async def _get_image_caption(self, image_url: str) -> str | None:
         """获取图片描述（v3.0.0: 并发限流 + 超时 + 缓存）"""
         if not self._image_caption_enabled:
@@ -1997,6 +2023,31 @@ class Main(star.Star):
             self._image_caption_cache.move_to_end(image_url)
             cached = self._image_caption_cache[image_url]
             return cached if cached else None
+
+        # 兜底：远程 URL 已失效（如 QQ 链接 rkey 过期）时直接跳过转述，
+        # 避免图片被核心预处理丢弃后视觉模型只收到文字、浪费整轮请求耗时。
+        if image_url.startswith(("http://", "https://")):
+            alive = await asyncio.to_thread(
+                self._image_url_still_alive_sync, image_url
+            )
+            if not alive:
+                self._mark_url_failed(image_url)
+                logger.info(
+                    "[ContextAware] 图片 URL 已失效，跳过转述: %s...",
+                    image_url[:60],
+                )
+                return None
+        elif not image_url.startswith(("data:", "base64://", "file://")):
+            # 既不是远程 URL 也不是可用的本地路径（如纯文件名引用）：
+            # 核心解析必然失败，直接跳过转述，不发无效请求。
+            if not os.path.exists(image_url):
+                self._mark_url_failed(image_url)
+                logger.info(
+                    "[ContextAware] 图片引用无法解析（非 URL 且本地文件不存在），"
+                    "跳过转述: %s...",
+                    image_url[:60],
+                )
+                return None
 
         t0 = time.perf_counter()
         try:
